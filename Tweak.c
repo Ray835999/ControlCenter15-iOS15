@@ -1,5 +1,5 @@
 /*
- * ControlCenter15 (com.ray.cc15) v1.0.3
+ * ControlCenter15 (com.ray.cc15) v1.0.4
  *
  * iOS 15 control center customization, from scratch.
  *
@@ -11,7 +11,7 @@
  *   v1.0.2 hooked CCUIContentModuleContainerView -layoutSubviews with radius 22.
  *          Did NOT crash, but 22pt is exactly what iOS 15 already draws for
  *          module tiles, so nothing looked different.
- *   v1.0.3 same safe target, but:
+ *   v1.0.4 same safe target, but:
  *            - radius raised to 40 (a 2x2 tile is ~70pt wide, so it becomes
  *              visibly round instead of a slightly-rounded square);
  *            - add a hairline border so even large tiles show a change;
@@ -115,6 +115,10 @@ static id mkstr(const char *s) {
     return ((id (*)(id, SEL, const char *))objc_msgSend)(
         objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), s);
 }
+extern char *strstr(const char *, const char *);
+static int has_word(const char *s, const char *w) {
+    return (s && w) ? (strstr(s, w) != 0) : 0;
+}
 static double readDouble(id dict, const char *key, double def) {
     if (!dict) return def;
     id v = send_id(dict, "objectForKey:", mkstr(key));
@@ -159,20 +163,54 @@ static void dump_tree(id view, int depth) {
     }
 }
 
+static id grayFill(double alpha) {
+    return ((id (*)(id, SEL, double, double))objc_msgSend)(
+        objc_getClass("UIColor"), sel_registerName("colorWithWhite:alpha:"), 1.0, alpha);
+}
+
+/* iOS 18 module cards are dark translucent plates. On iOS 15 the plate is a
+ * blur/material subview, NOT the container itself, so styling the container
+ * alone changes nothing. This walks one level down and styles the actual
+ * background views. */
+static void style_children(id view) {
+    id subs = send0(view, "subviews");
+    if (!subs) return;
+    unsigned long n = send_count(subs);
+    for (unsigned long i = 0; i < n && i < 24; i++) {
+        id s = send_at(subs, i);
+        if (!s) continue;
+        const char *nm = cls_name(s);
+        if (!(has_word(nm, "Effect") || has_word(nm, "Material") ||
+              has_word(nm, "Background") || has_word(nm, "Blur")))
+            continue;
+        id sl = send0(s, "layer");
+        if (sl && g_radius > 0.0 && g_radius < 500.0) {
+            send_d(sl, "setCornerRadius:", g_radius);
+            send_b(s, "setClipsToBounds:", (BOOL)1);
+        }
+        /* UIVisualEffectView paints through its contentView */
+        id cv = send0(s, "contentView");
+        id target = cv ? cv : s;
+        id fill = grayFill(0.10);
+        if (fill) send_id(target, "setBackgroundColor:", fill);
+    }
+}
+
 static void style_view(id view) {
     if (!view) return;
     id layer = send0(view, "layer");
-    if (!layer) return;
-
-    if (g_radius > 0.0 && g_radius < 500.0) {
-        send_d(layer, "setCornerRadius:", g_radius);
-        send_b(view, "setClipsToBounds:", (BOOL)1);
+    if (layer) {
+        if (g_radius > 0.0 && g_radius < 500.0) {
+            send_d(layer, "setCornerRadius:", g_radius);
+            send_b(view, "setClipsToBounds:", (BOOL)1);
+        }
+        if (g_border > 0.0 && g_border < 20.0) {
+            send_d(layer, "setBorderWidth:", g_border);
+            id cg = whiteCG(0.28);
+            if (cg) send_id(layer, "setBorderColor:", cg);
+        }
     }
-    if (g_border > 0.0 && g_border < 20.0) {
-        send_d(layer, "setBorderWidth:", g_border);
-        id cg = whiteCG(0.28);
-        if (cg) send_id(layer, "setBorderColor:", cg);
-    }
+    style_children(view);
     if (!g_dumped) {
         g_dumped = 1;
         lg("--- module view hierarchy ---");
@@ -210,6 +248,21 @@ static void cc15_willLayout(id self, SEL _cmd) {
     if (v) style_view(v);
     g_hits++;
     if (g_hits == 1) lg("hook fired: controller viewWillLayoutSubviews");
+    g_busy = 0;
+}
+
+/* entry point 3: guaranteed to run once when the module appears, even if the
+ * layout callbacks are not the path iOS 15 uses for module containers */
+static IMP g_origWillAppear = 0;
+static void cc15_willAppear(id self, SEL _cmd, BOOL animated) {
+    if (g_busy) return;
+    g_busy = 1;
+    if (g_origWillAppear) ((void (*)(id, SEL, BOOL))g_origWillAppear)(self, _cmd, animated);
+    if (!g_prefs_ok) { loadPrefs(); g_prefs_ok = 1; }
+    id v = send0(self, "view");
+    if (v) style_view(v);
+    g_hits++;
+    if (g_hits == 1) lg("hook fired: controller viewWillAppear:");
     g_busy = 0;
 }
 
@@ -259,6 +312,9 @@ static void try_install(void) {
     if (vc && install_one("CCUIContentModuleContainerViewController",
                           "viewWillLayoutSubviews",
                           (IMP)cc15_willLayout, &g_origWillLayout)) ok = 1;
+    if (vc && install_one("CCUIContentModuleContainerViewController",
+                          "viewWillAppear:",
+                          (IMP)cc15_willAppear, &g_origWillAppear)) ok = 1;
 
     if (ok) {
         lg("installed: container.layoutSubviews + controller.viewWillLayoutSubviews");
@@ -273,7 +329,7 @@ static void on_image(const void *mh, long slide) {
 
 __attribute__((constructor))
 static void cc15_init(void) {
-    lg("=== ControlCenter15 v1.0.3 loaded ===");
+    lg("=== ControlCenter15 v1.0.4 loaded ===");
     _dyld_register_func_for_add_image(on_image);
     try_install();
     if (!g_installed) lg("deferred: waiting for ControlCenterUI");
