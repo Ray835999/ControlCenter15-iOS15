@@ -1,29 +1,42 @@
 /*
- * ControlCenter15 (com.ray.cc15) — a from-scratch iOS 15 control center
- * customization tweak. It hooks ONLY classes that really exist on iOS 15
- * (CCUIContentModuleContainerViewController / CCUIRoundButton /
- *  CCUIModuleCollectionViewController), so it cannot crash SpringBoard the
- * way an iOS-18-only tweak would.
+ * ControlCenter15 (com.ray.cc15) v1.0.2
  *
- * Two crash-safety rules baked in:
- *  1) Any method that takes a floating-point argument is called through a
- *     TYPED function pointer (not the variadic objc_msgSend), otherwise the
- *     double would land in an integer register on arm64 and CALayer would
- *     get a garbage/NaN cornerRadius -> CoreAnimation crash -> SafeMode.
- *  2) A method is only replaced on the class that actually defines it; if the
- *     class only inherits it, we ADD an override with class_addMethod so we
- *     never mutate UIViewController's own method for every VC in SpringBoard.
+ * iOS 15 control center customization, from scratch.
  *
- * No static "other tweaks incompatible" banner, no version gate.
+ * WHY THIS BUILD IS DIFFERENT (v1.0 / v1.0.1 both hit SafeMode):
  *
- * Built with: clang -target arm64-apple-ios15.0 -dynamiclib -nostdlib
- *             -undefined dynamic_lookup -fuse-ld=lld -Wl,-adhoc_codesign
+ *  v1.0   hooked CCUIContentModuleContainerViewController -viewDidLoad.
+ *         That class does NOT define viewDidLoad on iOS 15 (it only has
+ *         loadView / viewWillLayoutSubviews), so the old code had to ADD a
+ *         brand new method to a live SpringBoard class. Adding methods to
+ *         classes that UIKit/ControlCenterUI is actively instantiating is
+ *         unsafe and was one crash source.
  *
- * Optional preferences file (edit with Filza, effective after next respring):
+ *  v1.0.1 hooked CCUIRoundButton -layoutSubviews and called the private
+ *         -_setCornerRadius:. That private setter can call setNeedsLayout,
+ *         which re-enters -layoutSubviews -> infinite layout recursion ->
+ *         watchdog kills SpringBoard -> SafeMode.
+ *
+ *  v1.0.2 hooks exactly ONE method:
+ *         CCUIContentModuleContainerView -layoutSubviews
+ *         - the class defines layoutSubviews itself (verified in the iOS 15
+ *           runtime index), so the superclass is never touched;
+ *         - it only writes PUBLIC properties (CALayer.cornerRadius and
+ *           UIView.clipsToBounds), neither of which triggers layout, so no
+ *           recursion is possible;
+ *         - the hook is installed lazily, only after ControlCenterUI has
+ *           actually been loaded (dyld image callback), so we never message
+ *           a nil class during early SpringBoard boot.
+ *
+ *  Everything that can fail is guarded: nil checks, own-method check with a
+ *  class_addMethod fallback, and a re-entrancy guard.
+ *
+ *  A runtime report is written to /var/mobile/cc15.log so that if anything
+ *  still goes wrong we can see exactly how far it got.
+ *
+ * Preferences (Filza, effective after respring):
  *   /var/jb/Library/Preferences/com.ray.cc15.plist
- *   ModuleCornerRadius (double, default 22)
- *   ButtonCornerRadius (double, default 34)
- *   ModuleBgRed/Green/Blue/Alpha (0..1, optional module tint)
+ *     ModuleCornerRadius  (double, default 22)
  */
 
 typedef void        *id;
@@ -36,135 +49,151 @@ typedef signed char  BOOL;
 extern id   objc_getClass(const char *);
 extern SEL  sel_registerName(const char *);
 extern id   objc_msgSend(id, SEL, ...);
-extern Class object_getClass(id);
 extern Method class_getInstanceMethod(Class, SEL);
 extern IMP  method_getImplementation(Method);
 extern IMP  method_setImplementation(Method, IMP);
 extern Method *class_copyMethodList(Class, unsigned *outCount);
-extern const char *method_getTypeEncoding(Method);
 extern SEL  method_getName(Method);
-extern BOOL  class_addMethod(Class, SEL, IMP, const char *);
-extern Class class_getSuperclass(Class);
+extern const char *method_getTypeEncoding(Method);
+extern BOOL class_addMethod(Class, SEL, IMP, const char *);
+extern void _dyld_register_func_for_add_image(void (*func)(const void *mh, long slide));
 
-/* generic object/integer-arg sends (variadic ABI is correct for these) */
-#define MSG(o, s, ...)  objc_msgSend((o), sel_registerName(s), ##__VA_ARGS__)
+/* libc, resolved from libSystem at runtime (dylib is linked with -nostdlib) */
+extern unsigned long strlen(const char *);
+extern int  open(const char *, int, ...);
+extern long write(int, const char *, unsigned long);
+extern int  close(int);
 
-/* typed float-arg sends (REQUIRED for double/CGFloat params on arm64) */
-static void send_cornerRadius(id o, const char *sel, double v) {
-    void (*f)(id, SEL, double) = (void *)objc_msgSend;
-    f(o, sel_registerName(sel), v);
+#define O_WRONLY 0x0001
+#define O_CREAT  0x0200
+#define O_APPEND 0x0008
+
+/* ---------------- tiny logger ---------------- */
+static void lg(const char *s) {
+    int fd = open("/var/mobile/cc15.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    write(fd, s, strlen(s));
+    write(fd, "\n", 1);
+    close(fd);
 }
-static id send_color_rgba(double r, double g, double b, double a) {
-    id (*f)(id, SEL, double, double, double, double) = (void *)objc_msgSend;
-    return f(objc_getClass("UIColor"),
-             sel_registerName("colorWithRed:green:blue:alpha:"),
-             r, g, b, a);
+
+/* ---------------- typed message sends ----------------
+ * A variadic objc_msgSend call does NOT put a double into d0 on arm64;
+ * the compiler must see the real prototype. Every call that passes or
+ * returns a non-integer type goes through one of these.               */
+static id send0(id o, const char *sel) {
+    return ((id (*)(id, SEL))objc_msgSend)(o, sel_registerName(sel));
+}
+static id send_id(id o, const char *sel, id a) {
+    return ((id (*)(id, SEL, id))objc_msgSend)(o, sel_registerName(sel), a);
+}
+static void send_d(id o, const char *sel, double v) {
+    ((void (*)(id, SEL, double))objc_msgSend)(o, sel_registerName(sel), v);
+}
+static void send_b(id o, const char *sel, BOOL v) {
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(o, sel_registerName(sel), v);
 }
 
-/* ---- tunables (overridden by the plist if present) ---- */
-static double g_modRadius = 22.0;
-static double g_btnRadius = 34.0;
-static double g_bgR = 1.0, g_bgG = 1.0, g_bgB = 1.0, g_bgA = 0.0;
-
-static id NSStr(const char *s) {
-    return MSG(objc_getClass("NSString"), "stringWithUTF8String:", s);
+static id mkstr(const char *s) {
+    return ((id (*)(id, SEL, const char *))objc_msgSend)(
+        objc_getClass("NSString"),
+        sel_registerName("stringWithUTF8String:"), s);
 }
 static double readDouble(id dict, const char *key, double def) {
     if (!dict) return def;
-    id v = MSG(dict, "objectForKey:", NSStr(key));
+    id v = send_id(dict, "objectForKey:", mkstr(key));
     if (!v) return def;
     return ((double (*)(id, SEL))objc_msgSend)(v, sel_registerName("doubleValue"));
 }
 
+/* ---------------- tunables ---------------- */
+static double g_radius   = 22.0;
+static int    g_prefs_ok = 0;
+
 static void loadPrefs(void) {
-    id dict = MSG(objc_getClass("NSDictionary"),
-                  "dictionaryWithContentsOfFile:",
-                  NSStr("/var/jb/Library/Preferences/com.ray.cc15.plist"));
+    Class dcls = objc_getClass("NSDictionary");
+    if (!dcls) return;
+    id dict = send_id((id)dcls, "dictionaryWithContentsOfFile:",
+                      mkstr("/var/jb/Library/Preferences/com.ray.cc15.plist"));
     if (!dict) return;
-    g_modRadius = readDouble(dict, "ModuleCornerRadius", g_modRadius);
-    g_btnRadius = readDouble(dict, "ButtonCornerRadius", g_btnRadius);
-    g_bgA       = readDouble(dict, "ModuleBgAlpha",     g_bgA);
-    g_bgR       = readDouble(dict, "ModuleBgRed",       g_bgR);
-    g_bgG       = readDouble(dict, "ModuleBgGreen",     g_bgG);
-    g_bgB       = readDouble(dict, "ModuleBgBlue",      g_bgB);
+    g_radius = readDouble(dict, "ModuleCornerRadius", g_radius);
 }
 
-/* ---- captured originals ---- */
-static void (*orig_ModuleContainerDidLoad)(id, SEL) = 0;
-static void (*orig_RoundButtonLayout)(id, SEL)      = 0;
-static void (*orig_CollectionDidLoad)(id, SEL)      = 0;
+/* ---------------- the one hook ---------------- */
+static IMP g_origLayout = 0;
+static int g_hits = 0;
+static int g_busy = 0;   /* re-entrancy guard (main-thread only, no TLV needed) */
 
-/* ---- round every module tile ---- */
-static void new_ModuleContainerDidLoad(id self, SEL _cmd) {
-    if (orig_ModuleContainerDidLoad) orig_ModuleContainerDidLoad(self, _cmd);
-    if (!(g_modRadius > 0.0 && g_modRadius < 1000.0)) return;
-    id view = MSG(self, "view");
-    if (!view) return;
-    id layer = MSG(view, "layer");
-    if (!layer) return;
-    send_cornerRadius(layer, "setCornerRadius:", g_modRadius);
-    MSG(view, "setClipsToBounds:", (BOOL)1);
-    if (g_bgA > 0.0 && g_bgA <= 1.0) {
-        id color = send_color_rgba(g_bgR, g_bgG, g_bgB, g_bgA);
-        if (color) MSG(view, "setBackgroundColor:", color);
+static void cc15_layout(id self, SEL _cmd) {
+    if (g_busy) return;
+    g_busy = 1;
+
+    if (g_origLayout) ((void (*)(id, SEL))g_origLayout)(self, _cmd);
+
+    if (!g_prefs_ok) { loadPrefs(); g_prefs_ok = 1; }
+
+    if (g_radius > 0.0 && g_radius < 500.0) {
+        id layer = send0(self, "layer");
+        if (layer) {
+            send_d(layer, "setCornerRadius:", g_radius);
+            send_b(self, "setClipsToBounds:", (BOOL)1);
+        }
     }
+
+    g_hits++;
+    if (g_hits == 1) lg("hook fired for the first time (cornerRadius applied)");
+    g_busy = 0;
 }
 
-/* ---- make the round toggles more circular / larger radius ---- */
-static void new_RoundButtonLayout(id self, SEL _cmd) {
-    if (orig_RoundButtonLayout) orig_RoundButtonLayout(self, _cmd);
-    if (g_btnRadius > 0.0 && g_btnRadius < 1000.0)
-        send_cornerRadius(self, "_setCornerRadius:", g_btnRadius);
-}
+/* ---------------- safe install ---------------- */
+static int g_installed = 0;
 
-/* ---- keep the grid itself square; tiles do the rounding ---- */
-static void new_CollectionDidLoad(id self, SEL _cmd) {
-    if (orig_CollectionDidLoad) orig_CollectionDidLoad(self, _cmd);
-    id view = MSG(self, "view");
-    if (!view) return;
-    id layer = MSG(view, "layer");
-    if (!layer) return;
-    send_cornerRadius(layer, "setCornerRadius:", 0.0);
-}
-
-/*
- * Safe swizzle: only replace the method on the class that defines it.
- * If the class only inherits the method, add an override (class_addMethod)
- * so UIViewController (and friends) are never touched.
- */
-static void safe_hook(const char *clsName, const char *selName,
-                      IMP replacement, IMP *origOut) {
-    Class cls = objc_getClass(clsName);
-    if (!cls || !replacement) return;
-    SEL sel = sel_registerName(selName);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-
-    unsigned count = 0;
-    Method *list = class_copyMethodList(cls, &count); /* not freed: tiny one-time leak OK */
+static int class_defines(Class cls, SEL sel, Method *out) {
+    unsigned n = 0;
+    Method *list = class_copyMethodList(cls, &n);
+    if (!list) return 0;
     int own = 0;
-    for (unsigned i = 0; i < count; i++) {
-        if (method_getName(list[i]) == sel) { own = 1; m = list[i]; break; }
+    for (unsigned i = 0; i < n; i++) {
+        if (method_getName(list[i]) == sel) { own = 1; if (out) *out = list[i]; break; }
     }
+    return own;
+}
 
-    const char *enc = method_getTypeEncoding(m);
-    IMP orig = method_getImplementation(m);
-    if (origOut) *origOut = orig;
+static void try_install(void) {
+    if (g_installed) return;
 
-    if (own) {
-        method_setImplementation(m, replacement);
+    Class cls = objc_getClass("CCUIContentModuleContainerView");
+    if (!cls) return;                 /* ControlCenterUI not loaded yet */
+
+    SEL sel = sel_registerName("layoutSubviews");
+    Method inherited = class_getInstanceMethod(cls, sel);
+    if (!inherited) { lg("ABORT: layoutSubviews not found on container view"); g_installed = 1; return; }
+
+    g_origLayout = method_getImplementation(inherited);
+
+    Method own = 0;
+    if (class_defines(cls, sel, &own) && own) {
+        method_setImplementation(own, (IMP)cc15_layout);
+        lg("installed: CCUIContentModuleContainerView.layoutSubviews (own method replaced)");
     } else {
-        class_addMethod(cls, sel, replacement, enc);
+        /* only inherits it -> add an override, superclass untouched */
+        class_addMethod(cls, sel, (IMP)cc15_layout, method_getTypeEncoding(inherited));
+        lg("installed: CCUIContentModuleContainerView.layoutSubviews (override added)");
     }
+    g_installed = 1;
+}
+
+/* ControlCenterUI may be dlopen()ed long after we run, so retry on every
+ * image the dyld adds. Naming a class that does not exist yet is harmless. */
+static void on_image(const void *mh, long slide) {
+    (void)mh; (void)slide;
+    try_install();
 }
 
 __attribute__((constructor))
 static void cc15_init(void) {
-    loadPrefs();
-    safe_hook("CCUIContentModuleContainerViewController", "viewDidLoad",
-              (IMP)new_ModuleContainerDidLoad, (IMP *)&orig_ModuleContainerDidLoad);
-    safe_hook("CCUIRoundButton", "layoutSubviews",
-              (IMP)new_RoundButtonLayout, (IMP *)&orig_RoundButtonLayout);
-    safe_hook("CCUIModuleCollectionViewController", "viewDidLoad",
-              (IMP)new_CollectionDidLoad, (IMP *)&orig_CollectionDidLoad);
+    lg("=== ControlCenter15 v1.0.2 loaded ===");
+    _dyld_register_func_for_add_image(on_image);  /* also fires for already-loaded images */
+    try_install();
+    if (!g_installed) lg("deferred: ControlCenterUI not loaded yet, waiting for dyld callback");
 }
