@@ -1,5 +1,5 @@
 /*
- * ControlCenter15 (com.ray.cc15) v1.0.4
+ * ControlCenter15 (com.ray.cc15) v2.0.0
  *
  * iOS 15 control center customization, from scratch.
  *
@@ -11,7 +11,7 @@
  *   v1.0.2 hooked CCUIContentModuleContainerView -layoutSubviews with radius 22.
  *          Did NOT crash, but 22pt is exactly what iOS 15 already draws for
  *          module tiles, so nothing looked different.
- *   v1.0.4 same safe target, but:
+ *   v2.0.0 same safe target, but:
  *            - radius raised to 40 (a 2x2 tile is ~70pt wide, so it becomes
  *              visibly round instead of a slightly-rounded square);
  *            - add a hairline border so even large tiles show a change;
@@ -266,6 +266,74 @@ static void cc15_willAppear(id self, SEL _cmd, BOOL animated) {
     g_busy = 0;
 }
 
+/* ============================================================
+ *  FORCED PASS
+ *  The module layout callbacks are not a reliable entry point on
+ *  iOS 15. Instead we wait until Control Center has actually been
+ *  presented (SBControlCenterController -_didPresent), then walk
+ *  the whole view tree and style every module container we find.
+ *  This does not depend on any particular internal layout path.
+ * ============================================================ */
+static void walk_apply(id v, int depth) {
+    if (!v || depth > 14) return;
+    const char *nm = cls_name(v);
+    if (has_word(nm, "ContentModuleContainerView"))
+        style_view(v);
+    id subs = send0(v, "subviews");
+    if (!subs) return;
+    unsigned long n = send_count(subs);
+    for (unsigned long i = 0; i < n && i < 64; i++) {
+        id s = send_at(subs, i);
+        if (s) walk_apply(s, depth + 1);
+    }
+}
+
+static id cc_root_view(id self) {
+    id vc = send0(self, "controlCenterViewController");
+    if (vc) {
+        id v = send0(vc, "view");
+        if (v) return v;
+    }
+    Class appc = objc_getClass("UIApplication");
+    if (appc) {
+        id app = ((id (*)(id, SEL))objc_msgSend)((id)appc,
+                     sel_registerName("sharedApplication"));
+        if (app) {
+            id win = send0(app, "keyWindow");
+            if (win) return win;
+        }
+    }
+    return 0;
+}
+
+static IMP g_origDidPresent = 0;
+static void cc15_didPresent(id self, SEL _cmd) {
+    if (g_origDidPresent) ((void (*)(id, SEL))g_origDidPresent)(self, _cmd);
+    if (!g_prefs_ok) { loadPrefs(); g_prefs_ok = 1; }
+    id root = cc_root_view(self);
+    if (root) {
+        walk_apply(root, 0);
+        lg("forced walk applied on _didPresent");
+    } else {
+        lg("forced walk: no root view found");
+    }
+}
+
+/* every layout pass of the CC layout view, belt and braces */
+static IMP g_origLayoutView = 0;
+static void cc15_layoutView(id self, SEL _cmd) {
+    if (g_origLayoutView) ((void (*)(id, SEL))g_origLayoutView)(self, _cmd);
+    if (!g_prefs_ok) { loadPrefs(); g_prefs_ok = 1; }
+    id subs = send0(self, "subviewsToLayout");
+    if (!subs) return;
+    unsigned long n = send_count(subs);
+    for (unsigned long i = 0; i < n && i < 64; i++) {
+        id s = send_at(subs, i);
+        if (!s) continue;
+        if (has_word(cls_name(s), "ContentModuleContainerView")) style_view(s);
+    }
+}
+
 /* ---------------- safe install ---------------- */
 static int g_installed = 0;
 
@@ -301,23 +369,29 @@ static int install_one(const char *clsName, const char *selName,
 static void try_install(void) {
     if (g_installed) return;
 
-    Class cv = objc_getClass("CCUIContentModuleContainerView");
-    Class vc = objc_getClass("CCUIContentModuleContainerViewController");
-    if (!cv && !vc) return;                /* ControlCenterUI not loaded yet */
+    Class scc = objc_getClass("SBControlCenterController");   /* always present in SpringBoard */
+    Class cv  = objc_getClass("CCUIContentModuleContainerView");
+    Class vc  = objc_getClass("CCUIContentModuleContainerViewController");
+    Class lvv = objc_getClass("CCUILayoutView");
+
+    if (!scc && !cv && !vc) return;          /* ControlCenterUI not loaded yet */
     if (!g_prefs_ok) { loadPrefs(); g_prefs_ok = 1; }
 
-    int ok = 0;
-    if (cv && install_one("CCUIContentModuleContainerView", "layoutSubviews",
-                          (IMP)cc15_layout, &g_origLayout)) ok = 1;
-    if (vc && install_one("CCUIContentModuleContainerViewController",
-                          "viewWillLayoutSubviews",
-                          (IMP)cc15_willLayout, &g_origWillLayout)) ok = 1;
-    if (vc && install_one("CCUIContentModuleContainerViewController",
-                          "viewWillAppear:",
-                          (IMP)cc15_willAppear, &g_origWillAppear)) ok = 1;
+    if (scc) install_one("SBControlCenterController", "_didPresent",
+                         (IMP)cc15_didPresent, &g_origDidPresent);
+    if (lvv) install_one("CCUILayoutView", "layoutSubviews",
+                         (IMP)cc15_layoutView, &g_origLayoutView);
+    if (cv)  install_one("CCUIContentModuleContainerView", "layoutSubviews",
+                         (IMP)cc15_layout, &g_origLayout);
+    if (vc) {
+        install_one("CCUIContentModuleContainerViewController", "viewWillLayoutSubviews",
+                    (IMP)cc15_willLayout, &g_origWillLayout);
+        install_one("CCUIContentModuleContainerViewController", "viewWillAppear:",
+                    (IMP)cc15_willAppear, &g_origWillAppear);
+    }
 
-    if (ok) {
-        lg("installed: container.layoutSubviews + controller.viewWillLayoutSubviews");
+    if (scc || cv || vc) {
+        lg("installed: didPresent + layoutView + container + controller");
         g_installed = 1;
     }
 }
@@ -329,7 +403,7 @@ static void on_image(const void *mh, long slide) {
 
 __attribute__((constructor))
 static void cc15_init(void) {
-    lg("=== ControlCenter15 v1.0.4 loaded ===");
+    lg("=== ControlCenter15 v2.0.0 loaded ===");
     _dyld_register_func_for_add_image(on_image);
     try_install();
     if (!g_installed) lg("deferred: waiting for ControlCenterUI");
